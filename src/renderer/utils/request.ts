@@ -104,7 +104,6 @@ export async function fetchWithProxy(input: RequestInfo | URL, init?: RequestIni
     headers: init?.headers,
     body: init?.body,
     signal: init?.signal || undefined,
-    useProx
-      y: true,
+    useProxy: true,
   })
 }
