@@ -65,7 +65,7 @@ async function doRequest(url: string, options: RequestOptions): Promise<Response
 
   const makeRequest = async () => {
     let res: Response
-    if (platform.type === 'mobile' && useProxy) {
+    if (platform.type === 'mobile') {
       res = await handleMobileRequest(requestUrl, method, headers, body, signal)
     } else if (platform.type === 'desktop' && useProxy && !isLocalHost(url)) {
       res = await desktopDirectRequestFromWindow(requestUrl, method, headers, body, signal)
@@ -104,6 +104,7 @@ export async function fetchWithProxy(input: RequestInfo | URL, init?: RequestIni
     headers: init?.headers,
     body: init?.body,
     signal: init?.signal || undefined,
-    useProxy: true,
+    useProx
+      y: true,
   })
 }
