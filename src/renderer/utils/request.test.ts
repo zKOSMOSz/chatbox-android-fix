@@ -62,6 +62,30 @@ describe('provider API request routing', () => {
     expect(mocks.desktopDirectRequest).not.toHaveBeenCalled()
   })
 
+  it('always uses the native transport on mobile, even when compatibility is disabled', async () => {
+    mocks.platform.type = 'mobile'
+    const response = new Response('ok')
+    mocks.mobileRequest.mockResolvedValue(response)
+    const rendererFetch = vi.fn()
+    vi.stubGlobal('fetch', rendererFetch)
+
+    await expect(
+      apiRequest.post('https://api.example/v1/chat/completions', { authorization: 'Bearer secret' }, '{}', {
+        useProxy: false,
+        retry: 0,
+      })
+    ).resolves.toBe(response)
+
+    expect(mocks.mobileRequest).toHaveBeenCalledWith(
+      'https://api.example/v1/chat/completions',
+      'POST',
+      expect.any(Headers),
+      '{}',
+      undefined
+    )
+    expect(rendererFetch).not.toHaveBeenCalled()
+  })
+
   it('preserves the ApiError contract for failed desktop direct responses', async () => {
     mocks.desktopDirectRequest.mockResolvedValue(new Response('upstream unavailable', { status: 503 }))
 
