@@ -45,7 +45,9 @@ jobs:
         run: npx cap add android
 
       - name: Build renderer and sync Capacitor
-        run: pnpm run mobile:sync:android
+        run: |
+          CHATBOX_BUILD_TARGET=mobile_app CHATBOX_BUILD_PLATFORM=android pnpm run build:renderer
+          npx cap sync android
 
       - name: Build debug APK
         working-directory: android
