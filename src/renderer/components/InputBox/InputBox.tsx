@@ -118,8 +118,8 @@ import ProviderImageIcon from '../icons/ProviderImageIcon'
 import ModelSelectorV2 from '../ModelSelectorV2'
 import AgentModeButton from './AgentModeButton'
 import { FileMiniCard, getParserTypeLabel, ImageMiniCard } from './Attachments'
-import { ComposerSettingsMenu } from './ComposerSettingsMenu'
 import { getAgentModeUIState } from './agentModeState'
+import { ComposerSettingsMenu } from './ComposerSettingsMenu'
 import { ImageUploadInput } from './ImageUploadInput'
 import { INPUT_SURFACE_CLASS_NAME, INPUT_SURFACE_MIN_HEIGHT_CLASS_NAME, INPUT_SURFACE_STYLE } from './inputSurface'
 import { MessageInputField, type MessageInputFieldRef } from './MessageInputField'
@@ -133,6 +133,7 @@ import { getComposerPlaceholder, getSubmitAction, getSubmitControl } from './sub
 import TokenCountMenu from './TokenCountMenu'
 import { useModelToolCapabilities } from './useModelToolCapabilities'
 import { useReasoningControlState } from './useReasoningControlState'
+import { useThreadCreation } from './useThreadCreation'
 import { WebSearchUnavailableBanner } from './WebSearchUnavailableBanner'
 import WorkModeStatusRow from './WorkModeStatusRow'
 
@@ -163,8 +164,8 @@ export type InputBoxProps = {
   onSelectModel?(provider: string, model: string): void
   onSubmit?(payload: InputBoxPayload): Promise<void>
   onStopGenerating?(): boolean
-  onStartNewThread?(): boolean
-  onRollbackThread?(): boolean
+  stopGenerationStatus?: 'idle' | 'stopping' | 'failed'
+  onStartNewThread?(): Promise<(() => Promise<boolean>) | undefined>
   onClickSessionSettings?(): boolean | Promise<boolean>
   onViewCompactionSummary?(summaryMessageId: string): void
 }
@@ -206,8 +207,8 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       onSelectModel,
       onSubmit,
       onStopGenerating,
+      stopGenerationStatus = 'idle',
       onStartNewThread,
-      onRollbackThread,
       onClickSessionSettings,
       onViewCompactionSummary,
     },
@@ -741,7 +742,8 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       submitInProgress ||
       submitAvailability.blockReason !== undefined ||
       hasPreprocessErrors ||
-      hasBlockedSessionRagFiles
+      hasBlockedSessionRagFiles ||
+      stopGenerationStatus !== 'idle'
     const submitControl = getSubmitControl({
       generating,
       hasDraft: !disableSubmit,
@@ -751,6 +753,18 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       hasModel: Boolean(model),
     })
     const showingStopControl = submitControl === 'stop'
+    const submitControlLabel =
+      stopGenerationStatus === 'stopping'
+        ? t('Stopping...')
+        : stopGenerationStatus === 'failed'
+          ? t('Retry stopping')
+          : submitControl === 'queue'
+            ? t('Will send after the current response finishes')
+            : submitControl === 'stop'
+              ? generatingCount > 1
+                ? t('Stop all {{n}} replies', { n: generatingCount })
+                : t('Stop')
+              : t('Send')
     const composerPlaceholder = getComposerPlaceholder({
       blockReason: submitAvailability.blockReason,
       generating,
@@ -820,17 +834,17 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       [currentSessionId, isNewSession]
     )
 
-    const [showRollbackThreadButton, setShowRollbackThreadButton] = useState(false)
-    useEffect(() => {
-      if (showRollbackThreadButton) {
-        const tid = setTimeout(() => {
-          setShowRollbackThreadButton(false)
-        }, 5000)
-        return () => {
-          clearTimeout(tid)
-        }
-      }
-    }, [showRollbackThreadButton])
+    const {
+      pending: threadActionPending,
+      canRollback: showRollbackThreadButton,
+      start: startNewThread,
+      rollback: rollbackThread,
+      dismissUndo: dismissThreadRollback,
+    } = useThreadCreation({
+      sessionId: currentSessionId || 'new',
+      create: onStartNewThread,
+      onError: (error) => toastActions.add(`${t('Failed')}: ${error instanceof Error ? error.message : String(error)}`),
+    })
 
     useImperativeHandle(
       ref,
@@ -869,7 +883,8 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
           isPreprocessing ||
           submitAvailability.blockReason !== undefined ||
           hasPreprocessErrors ||
-          hasBlockedSessionRagFiles,
+          hasBlockedSessionRagFiles ||
+          stopGenerationStatus !== 'idle',
         queueEnabled,
         hasModel: Boolean(model),
       })
@@ -971,7 +986,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
             },
             message: undefined,
           })
-          setShowRollbackThreadButton(false)
+          dismissThreadRollback()
           markReasoningSettingsCommitted()
           if (platform.type !== 'mobile' && messageTextForHistory) {
             addInputBoxHistory(messageTextForHistory)
@@ -1156,20 +1171,6 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         sessionMode,
       ]
     )
-
-    const startNewThread = () => {
-      const res = onStartNewThread?.()
-      if (res) {
-        setShowRollbackThreadButton(true)
-      }
-    }
-
-    const rollbackThread = () => {
-      const res = onRollbackThread?.()
-      if (res) {
-        setShowRollbackThreadButton(false)
-      }
-    }
 
     const startFilePreprocessing = (file: File, options: InsertFilesOptions = {}) => {
       const fileKey = StorageKeyGenerator.fileUniqKey(file)
@@ -1586,6 +1587,23 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               />
             )}
 
+            {stopGenerationStatus === 'failed' && (
+              <Flex
+                role="alert"
+                align="center"
+                justify="space-between"
+                gap="sm"
+                className="rounded-md bg-red-50 px-2 py-1 dark:bg-red-950/30"
+              >
+                <Text size="xs" c="red" fw={500}>
+                  {t('The response could not be stopped safely. Retry to finish saving it.')}
+                </Text>
+                <Button variant="subtle" color="red" size="compact-xs" onClick={onStopGenerating}>
+                  {t('Retry')}
+                </Button>
+              </Flex>
+            )}
+
             {/* Input Row */}
             <Flex align="flex-end" gap={4}>
               <MessageInputField
@@ -1611,17 +1629,12 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               <Tooltip
                 // `n` rather than `count`, so i18next does not engage plural resolution for a
                 // label that is only ever shown for more than one reply.
-                label={
-                  submitControl === 'queue'
-                    ? t('Will send after the current response finishes')
-                    : generatingCount > 1
-                      ? t('Stop all {{n}} replies', { n: generatingCount })
-                      : t('Stop')
-                }
+                label={submitControlLabel}
                 disabled={submitControl === 'send'}
                 withArrow
               >
                 <ActionIcon
+                  aria-label={submitControlLabel}
                   data-testid={
                     submitControl === 'stop'
                       ? TestId.chat.stop
@@ -1629,7 +1642,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                         ? TestId.chat.queuedMessageEnqueue
                         : TestId.chat.send
                   }
-                  disabled={submitBlocked && !showingStopControl}
+                  disabled={stopGenerationStatus === 'stopping' || (submitBlocked && !showingStopControl)}
                   size={32}
                   variant="filled"
                   color={showingStopControl ? 'dark' : 'chatbox-brand'}
@@ -1644,7 +1657,11 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                   }
                 >
                   {showingStopControl ? (
-                    <ScalableIcon icon={IconPlayerStopFilled} size={16} />
+                    stopGenerationStatus === 'stopping' ? (
+                      <Loader size={16} color="white" />
+                    ) : (
+                      <ScalableIcon icon={IconPlayerStopFilled} size={16} />
+                    )
                   ) : (
                     <ScalableIcon icon={IconArrowUp} size={16} />
                   )}
@@ -1931,14 +1948,19 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                         data-testid={TestId.chat.newThread}
                         aria-label={t('New Thread')}
                         onClick={startNewThread}
-                        disabled={!onStartNewThread}
+                        disabled={!onStartNewThread || threadActionPending}
+                        aria-busy={threadActionPending}
                         className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors disabled:opacity-50"
                       >
-                        <IconFilePencil
-                          size={toolbarIconSize}
-                          strokeWidth={1.8}
-                          className="text-[var(--chatbox-tint-secondary)]"
-                        />
+                        {threadActionPending ? (
+                          <Loader size={toolbarIconSize} />
+                        ) : (
+                          <IconFilePencil
+                            size={toolbarIconSize}
+                            strokeWidth={1.8}
+                            className="text-[var(--chatbox-tint-secondary)]"
+                          />
+                        )}
                       </UnstyledButton>
                     </Tooltip>
                   ))}
@@ -1966,6 +1988,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                     canCreateThread={canCreateThread}
                     toolbarIconSize={toolbarIconSize}
                     onStartNewThread={startNewThread}
+                    threadActionPending={threadActionPending}
                     onClickSessionSettings={onClickSessionSettings}
                   />
                 )}

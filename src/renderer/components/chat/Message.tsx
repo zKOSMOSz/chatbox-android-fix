@@ -8,10 +8,15 @@ import {
   shouldShowConcurrentReplyStop,
 } from '@chatbox/core/session/action-gates'
 import { isCancellableGeneratingAssistantMessage } from '@chatbox/core/session/generation-state'
-import { isActionAvailableInMode, type SessionMode } from '@chatbox/core/session/mode-policy'
+import { getMessageFinishTip } from '@chatbox/core/session/message-finish-tip'
+import {
+  isActionAvailableInMode,
+  type SessionMode,
+  shouldRestrictMessageEditToLastOutput,
+} from '@chatbox/core/session/mode-policy'
 import type { PromptCacheDeleteTarget } from '@chatbox/core/session/prompt-cache-policy'
 import NiceModal from '@ebay/nice-modal-react'
-import { ActionIcon, type ActionIconProps, Button, Flex, Loader, Modal, Stack, Text } from '@mantine/core'
+import { ActionIcon, type ActionIconProps, Anchor, Button, Flex, Loader, Modal, Stack, Text } from '@mantine/core'
 import { Box, Grid, useTheme } from '@mui/material'
 import { TestId } from '@shared/automation/testids'
 import { findMessageLocation } from '@shared/session/message-forks'
@@ -26,6 +31,7 @@ import {
   IconCopy,
   IconDotsVertical,
   IconInfoCircle,
+  IconLoader2,
   IconMessageReport,
   IconPencil,
   IconPhotoPlus,
@@ -40,7 +46,7 @@ import clsx from 'clsx'
 import * as dateFns from 'date-fns'
 import type React from 'react'
 import { type FC, forwardRef, type MouseEventHandler, memo, useCallback, useMemo, useRef, useState } from 'react'
-import { useTranslation } from 'react-i18next'
+import { Trans, useTranslation } from 'react-i18next'
 import { trackAgentModeSuggestionAction } from '@/analytics/agent-mode'
 import { trackJkClickEvent } from '@/analytics/jk'
 import { JK_EVENTS, JK_PAGE_NAMES } from '@/analytics/jk-events'
@@ -48,6 +54,7 @@ import { rendererApplication } from '@/app/renderer-application'
 import Markdown from '@/components/Markdown'
 import StreamingTextFade from '@/components/StreamingTextFade'
 import { AppTooltip as Tooltip1 } from '@/components/ui/tooltip'
+import { useMessageGenerationStop } from '@/hooks/useGenerationStop'
 import { useIsSmallScreen } from '@/hooks/useScreenChange'
 import { formatElapsedTime } from '@/hooks/useThinkingTimer'
 import { cn } from '@/lib/utils'
@@ -65,7 +72,6 @@ import {
   regenerateInNewFork,
   retryFromLastToolCallAfterApiError,
 } from '@/stores/session/generation'
-import { stopMessageGeneration } from '@/stores/session/generation-cancellation'
 import { modifyMessage, removeMessage } from '@/stores/session/messages'
 import * as toastActions from '@/stores/toastActions'
 import { confirmPromptCacheBreakingAction, isPromptCacheBreakConfirmDismissed } from '@/utils/prompt-cache-confirm'
@@ -226,24 +232,37 @@ const _Message: FC<Props> = (props) => {
     setQuote(input)
   }, [msg, setQuote])
 
-  const handleStop = useCallback(async () => {
+  const {
+    requestStop: requestMessageStop,
+    status: messageStopStatus,
+    stopAndWait: stopMessageAndWait,
+  } = useMessageGenerationStop(sessionId, msg.id)
+
+  const handleStop = useCallback(async (): Promise<boolean> => {
     if (msg.generating) {
-      await stopMessageGeneration(sessionId, msg.id)
-      return
+      try {
+        await stopMessageAndWait()
+        return true
+      } catch {
+        return false
+      }
     }
     await modifyMessage(sessionId, { ...msg, generating: false }, true)
-  }, [sessionId, msg])
+    return true
+  }, [msg, sessionId, stopMessageAndWait])
 
   const generationLocked = isGenerationLocked(sessionLocks)
 
   // Static mode policy (hidden entries), as opposed to the transient
-  // sessionLocks gates (disabled + notice). Work mode allows delete;
-  // user messages may only be edited together with a resend.
+  // sessionLocks gates (disabled + notice). Work mode allows delete and
+  // assistant edits (last output text only); user messages may only be
+  // edited together with a resend.
   const canReplyBelow = isActionAvailableInMode('reply-below', sessionMode)
   const canDeleteMessage = isActionAvailableInMode('delete-message', sessionMode)
   const [confirmCacheBreakingDelete, setConfirmCacheBreakingDelete] = useState(false)
   const canEditMessage = msg.role === 'user' || isActionAvailableInMode('edit-assistant-message', sessionMode)
-  const editIsResendOnly = !isActionAvailableInMode('save-message-edit', sessionMode)
+  const editIsResendOnly = msg.role === 'user' && !isActionAvailableInMode('save-message-edit', sessionMode)
+  const lastOutputTextOnly = shouldRestrictMessageEditToLastOutput(sessionMode, msg.role)
 
   const notifyActionBlocked = useCallback(
     (reason: SessionActionBlockReason) => {
@@ -258,7 +277,7 @@ const _Message: FC<Props> = (props) => {
       notifyActionBlocked(gate.reason)
       return
     }
-    await handleStop()
+    if (!(await handleStop())) return
     await regenerateInNewFork(sessionId, msg)
   }, [sessionLocks, handleStop, msg, notifyActionBlocked, sessionId])
 
@@ -412,7 +431,7 @@ const _Message: FC<Props> = (props) => {
     // Deleting a still-streaming reply must stop it first: the stream writes by
     // message id and would keep running invisibly after the message is gone.
     if (msg.generating) {
-      await handleStop()
+      if (!(await handleStop())) return
     }
     await removeMessage(sessionId, msg.id)
   }, [confirmCacheBreakingDelete, handleStop, msg, sessionId, shouldConfirmPromptCacheDelete])
@@ -429,8 +448,8 @@ const _Message: FC<Props> = (props) => {
     // regenerate-class action and stays locked like Retry.
     const resendGate = getSessionActionGate('save-and-resend', sessionLocks, { messageGenerating: msg.generating })
     if (editIsResendOnly && !resendGate.allowed) {
-      // Work mode edits must resend; with the resend gate closed the editor
-      // would have no primary action left, so surface the block instead.
+      // Work-mode user edits must resend; with the resend gate closed the
+      // editor would have no primary action left, so surface the block instead.
       notifyActionBlocked(resendGate.reason)
       return
     }
@@ -439,8 +458,9 @@ const _Message: FC<Props> = (props) => {
       msg,
       hideSaveAndResend: !resendGate.allowed,
       resendOnly: editIsResendOnly,
+      lastOutputTextOnly,
     })
-  }, [sessionLocks, msg, notifyActionBlocked, sessionId, editIsResendOnly])
+  }, [sessionLocks, msg, notifyActionBlocked, sessionId, editIsResendOnly, lastOutputTextOnly])
 
   const onViewMessageJson = useCallback(async () => {
     await NiceModal.show('json-viewer', { title: t('Message Raw JSON'), data: msg })
@@ -454,12 +474,18 @@ const _Message: FC<Props> = (props) => {
       tips.push({ label: props.msg.model || 'unknown', tooltip: t('Model') as string })
     }
     if (showTokenUsed && msg.role === 'assistant' && !msg.generating) {
-      const consumedTokens = getMessageTokenDisplay(msg)
-      if (consumedTokens) {
+      const tokenDisplay = getMessageTokenDisplay(msg)
+      if (tokenDisplay) {
         tips.push({
-          label: `${consumedTokens} tokens`,
+          label: `${tokenDisplay.totalTokens} tokens`,
           tooltip: t('Total tokens consumed') as string,
         })
+        if (tokenDisplay.cachedInputTokens) {
+          tips.push({
+            label: `${tokenDisplay.cachedInputTokens} cached`,
+            tooltip: t('Cached input tokens') as string,
+          })
+        }
       }
     }
     if (showWordCount && !msg.generating) {
@@ -480,9 +506,7 @@ const _Message: FC<Props> = (props) => {
     }
   }
 
-  if (msg.finishReason && ['content-filter', 'length', 'error'].includes(msg.finishReason)) {
-    tips.push({ label: msg.finishReason })
-  }
+  const finishTip = getMessageFinishTip(msg, t)
 
   if (showMessageTimestamp && msg.timestamp !== undefined) {
     const date = new Date(msg.timestamp)
@@ -1058,6 +1082,27 @@ const _Message: FC<Props> = (props) => {
           </div>
         )}
         {!isBubbleLayout && msg.error && <div className="mt-2">{errorTipsElement}</div>}
+        {finishTip && (
+          <Flex align="flex-start" gap={6} mt="xs" role="status">
+            <ScalableIcon icon={IconInfoCircle} size={14} className="flex-none mt-[2px] text-chatbox-tint-tertiary" />
+            <Text size="xs" c="chatbox-tertiary" lh={1.45}>
+              {finishTip}
+              {msg.finishReason === 'length' && (
+                <>
+                  {' '}
+                  <Trans
+                    i18nKey="You can also adjust Max Output Tokens in <settings>Conversation Settings</settings>."
+                    components={{
+                      settings: (
+                        <Anchor component="button" size="xs" c="chatbox-brand" onClick={onClickAssistantAvatar} />
+                      ),
+                    }}
+                  />
+                </>
+              )}
+            </Text>
+          </Flex>
+        )}
         {leadingStatuses && leadingStatuses.length > 0 && <div className="mt-2">{statusElements}</div>}
       </div>
     </>
@@ -1081,12 +1126,20 @@ const _Message: FC<Props> = (props) => {
       )
     })
 
-  const showConcurrentReplyStop = shouldShowConcurrentReplyStop({
-    allowStop: allowGeneratingStop,
-    cancellable: isCancellableGeneratingAssistantMessage(msg, generationRuntimeActive),
-    generatingReplyCount: sessionLocks.generatingReplyCount,
-    sessionType: props.sessionType,
-  })
+  const showConcurrentReplyStop =
+    messageStopStatus !== 'idle' ||
+    shouldShowConcurrentReplyStop({
+      allowStop: allowGeneratingStop,
+      cancellable: isCancellableGeneratingAssistantMessage(msg, generationRuntimeActive),
+      generatingReplyCount: sessionLocks.generatingReplyCount,
+      sessionType: props.sessionType,
+    })
+  const messageStopLabel =
+    messageStopStatus === 'stopping'
+      ? t('Stopping this reply...')
+      : messageStopStatus === 'failed'
+        ? t('Retry stopping this reply')
+        : t('Stop generating this reply')
   const generatingActions = showConcurrentReplyStop && (
     <Flex gap={0} m="4px -4px -4px -4px" align="center" className={isSmallScreen ? 'sticky bottom-4' : ''}>
       <Flex
@@ -1097,7 +1150,20 @@ const _Message: FC<Props> = (props) => {
             : ''
         }
       >
-        <MessageActionIcon icon={IconPlayerStopFilled} tooltip={t('Stop generating this reply')} onClick={handleStop} />
+        {messageStopStatus === 'failed' && (
+          <Text size="xs" c="red" px={4} role="alert">
+            {t('Stop failed')}
+          </Text>
+        )}
+        <MessageActionIcon
+          icon={messageStopStatus === 'stopping' ? IconLoader2 : IconPlayerStopFilled}
+          tooltip={messageStopLabel}
+          iconClassName={messageStopStatus === 'stopping' ? 'animate-spin' : undefined}
+          disabled={messageStopStatus === 'stopping'}
+          onClick={() => {
+            requestMessageStop()
+          }}
+        />
       </Flex>
     </Flex>
   )
@@ -1399,10 +1465,11 @@ export const MessageActionIcon = forwardRef<
   ActionIconProps & {
     tooltip?: string | null
     testId?: string
+    iconClassName?: string
     onClick?: MouseEventHandler<HTMLButtonElement>
     icon: React.ElementType<IconProps>
   }
->(({ tooltip, icon, testId, ...props }, ref) => {
+>(({ tooltip, icon, iconClassName, testId, ...props }, ref) => {
   const isSmallScreen = useIsSmallScreen()
   const actionIcon = (
     <ActionIcon
@@ -1419,7 +1486,7 @@ export const MessageActionIcon = forwardRef<
       data-testid={testId}
       {...props}
     >
-      <ScalableIcon icon={icon} size={isSmallScreen ? 20 : 16} />
+      <ScalableIcon icon={icon} size={isSmallScreen ? 20 : 16} className={iconClassName} />
     </ActionIcon>
   )
 
